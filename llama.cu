@@ -125,7 +125,6 @@ void free_run_state(RunState* s) {
     CHECK_CUDA(cudaFree(s->hb));
     CHECK_CUDA(cudaFree(s->hb2));
     CHECK_CUDA(cudaFree(s->q));
-    CHECK_CUDA(cudaFree(s->att));
     CHECK_CUDA(cudaFree(s->key_cache));
     CHECK_CUDA(cudaFree(s->value_cache));
     CHECK_CUDA(cudaFree(s->logits_d));
