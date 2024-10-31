@@ -671,7 +671,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         // CHECK_CUDA(cudaDeviceSynchronize());
 
         // residual connection
-        skip_conn(x, s->xb2, dim);
+        skip_conn(x, s->xb, dim);
         // CHECK_CUDA(cudaDeviceSynchronize());
     }
 
