@@ -30,7 +30,7 @@ def serialize(file, tensor, dtype):
     struct_format_char = {
         torch.float32: "f",
         torch.float16: "h",
-        torch.int8:    "b",
+        torch.int8: "b",
     }
     b = struct.pack(f"{len(d)}{struct_format_char[dtype]}", *d)
     file.write(b)
@@ -90,13 +90,13 @@ def export_hf_model_to_binary(model_path, export_path, dtype=torch.float32):
         model_weights["mlp_down"].append(hf_dict[f"model.layers.{i}.mlp.down_proj.weight"])
         model_weights["mlp_up"].append(hf_dict[f"model.layers.{i}.mlp.up_proj.weight"])
 
-    model_weights["final_norm_weight"] = [hf_dict["model.embed_tokens.weight"]]
-    model_weights["lm_head_weight"] = [hf_dict["model.embed_tokens.weight"]]
+    model_weights["final_norm_weight"] = [hf_dict["model.norm.weight"]]
+    model_weights["lm_head_weight"] = [hf_dict["lm_head.weight"]]
 
     for layer_name, layer in model_weights.items():
         print(f"Writing {layer_name} weights")
         for w in layer:
-            serialize(out_file, w)
+            serialize(out_file, w, dtype)
 
     # write to binary file
     out_file.close()
