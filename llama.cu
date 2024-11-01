@@ -131,7 +131,7 @@ void free_run_state(RunState* s) {
     CHECK_CUDA(cudaFreeHost(s->logits));
 }
 
-void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
+void memory_map_weights(TransformerWeights *w, Config* p, float* ptr) {
     int head_size = p->dim / p->n_heads;
     // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
@@ -157,9 +157,7 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
     ptr += n_layers * p->dim * p->hidden_dim;
     w->rms_final_weight = ptr;
     ptr += p->dim;
-    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
-    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
-    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+    w->wcls = ptr;
 }
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
@@ -168,9 +166,6 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
     // read in the config header
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
-    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
-    int shared_weights = config->vocab_size > 0 ? 1 : 0;
-    config->vocab_size = abs(config->vocab_size);
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
@@ -184,7 +179,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     size_t weights_size = *file_size - sizeof(Config);
     CHECK_CUDA(cudaMalloc((void **)&weights_ptr, weights_size));
     CHECK_CUDA(cudaMemcpy(weights_ptr, *data + sizeof(Config) / sizeof(float), weights_size, cudaMemcpyHostToDevice));
-    memory_map_weights(weights, config, weights_ptr, shared_weights);
+    memory_map_weights(weights, config, weights_ptr);
 }
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
