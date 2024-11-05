@@ -73,8 +73,7 @@ __device__ __forceinline__ float warpReduceSum(float val) {
     return val;
 }
 
-
-__global__ void mat_vec_kernel(float *C, const float *__restrict__ B, const float *__restrict__ A,
+__global__ void gemv_fp32_kernel(float *C, const float *__restrict__ B, const float *__restrict__ A,
                                int n, int d, int numSerialLoads) {
     int index = blockIdx.x * blockDim.y + threadIdx.y;
     if (index >= d)
@@ -106,9 +105,9 @@ __global__ void mat_vec_kernel(float *C, const float *__restrict__ B, const floa
 void matmul_gpu_v1(float *xout, float *x, float *w, int n, int d, int batch_size) {
     int serialElements = DIVUP(n, WARP_SIZE);
     int serialLoads = DIVUP(serialElements, 4);
-    dim3 blockDim(WARP_SIZE, 4);
-    dim3 gridDim(DIVUP(d, 4), batch_size);
-    mat_vec_kernel<<<gridDim, blockDim>>>(xout, x, w, n, d, serialLoads);
+    dim3 blockDim(WARP_SIZE, 16);
+    dim3 gridDim(DIVUP(d, 16), batch_size);
+    gemv_fp32_kernel<<<gridDim, blockDim>>>(xout, x, w, n, d, serialLoads);
     CHECK_CUDA(cudaGetLastError());
 }
 
@@ -119,12 +118,12 @@ void matmul_gpu(float *xout, float *x, float *w, int n, int d, int batch_size) {
     CHECK_CUDA(cudaMalloc(&wGPU, sizeof(float) * d * n));
     CHECK_CUDA(cudaMemcpy(xGPU, x, sizeof(float) * n * batch_size, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(wGPU, w, sizeof(float) * d * n, cudaMemcpyHostToDevice));
-    
+
     // WARM UP
     for (int i=0; i<= 3; ++i) {
         matmul_gpu_v1(xoutGPU, xGPU, wGPU, n, d, batch_size);
     }
-    
+
     float elapsed_time = 0.0;
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaEventCreate(&start));
@@ -134,7 +133,7 @@ void matmul_gpu(float *xout, float *x, float *w, int n, int d, int batch_size) {
         matmul_gpu_v1(xoutGPU, xGPU, wGPU, n, d, batch_size);
     }
     CHECK_CUDA(cudaEventRecord(stop));
-    CHECK_CUDA(cudaEventSynchronize(stop)); 
+    CHECK_CUDA(cudaEventSynchronize(stop));
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaEventElapsedTime(&elapsed_time, start, stop));
     printf("%f sec, GFLOPS: %f \n", elapsed_time, 2ll * n * d * batch_size * 10 / (elapsed_time * 1e6));
@@ -254,9 +253,9 @@ void test_matmul(bool verbose) {
     matmul_cublas_sgemv(C_gpu, B, A, n, d, batch_size);
     matmul_gpu(C_gpu, B, A, n, d, batch_size);
 
-    // matmul_cpu(C_cpu, B, A, n, d, batch_size);
+    matmul_cpu(C_cpu, B, A, n, d, batch_size);
 
-    // vec_diff_check(C_cpu, C_gpu, d * batch_size, verbose);
+    vec_diff_check(C_cpu, C_gpu, d * batch_size, verbose);
 
     // printf("A: \n");
     // print_mat(A, d, n);
