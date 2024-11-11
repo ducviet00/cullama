@@ -13,10 +13,11 @@
 #include <sys/mman.h>
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
-#define MAX_SEQ_LEN 4096
+#define MAX_SEQ_LEN 1024
 #define DIVUP(x, y) ((x + y - 1) / y)
 #define BLOCK_SIZE 32
 #define WARP_SIZE 32
@@ -47,41 +48,42 @@ typedef struct {
 
 typedef struct {
     // token embedding table
-    float* token_embedding_table;    // (vocab_size, dim)
+    half* token_embedding_table;    // (vocab_size, dim)
     // weights for rmsnorms
-    float* rms_att_weight; // (layer, dim) rmsnorm weights
-    float* rms_ffn_weight; // (layer, dim)
+    half* rms_att_weight; // (layer, dim) rmsnorm weights
+    half* rms_ffn_weight; // (layer, dim)
     // weights for matmuls. note dim == n_heads * head_size
-    float* wq; // (layer, dim, n_heads * head_size)
-    float* wk; // (layer, dim, n_kv_heads * head_size)
-    float* wv; // (layer, dim, n_kv_heads * head_size)
-    float* wo; // (layer, n_heads * head_size, dim)
+    half* wq; // (layer, dim, n_heads * head_size)
+    half* wk; // (layer, dim, n_kv_heads * head_size)
+    half* wv; // (layer, dim, n_kv_heads * head_size)
+    half* wo; // (layer, n_heads * head_size, dim)
     // weights for ffn
-    float* w1; // (layer, hidden_dim, dim)
-    float* w2; // (layer, dim, hidden_dim)
-    float* w3; // (layer, hidden_dim, dim)
+    half* w1; // (layer, hidden_dim, dim)
+    half* w2; // (layer, dim, hidden_dim)
+    half* w3; // (layer, hidden_dim, dim)
     // final rmsnorm
-    float* rms_final_weight; // (dim,)
+    half* rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
-    float* wcls;
+    half* wcls;
 } TransformerWeights;
 
 typedef struct {
     // current wave of activations
-    float *x; // activation at current time stamp (dim,)
-    float *xb; // same, but inside a residual branch (dim,)
-    float *xb2; // an additional buffer just for convenience (dim,)
-    float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *q; // query (dim,)
-    float *k; // key (dim,)
-    float *v; // value (dim,)
-    float *att; // buffer for scores/attention values (n_heads, seq_len)
+    half *x; // activation at current time stamp (dim,)
+    half *xb; // same, but inside a residual branch (dim,)
+    half *xb2; // an additional buffer just for convenience (dim,)
+    half *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
+    half *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+    half *q; // query (dim,)
+    half *k; // key (dim,)
+    half *v; // value (dim,)
+    half *att; // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
-    float *logits_d; // output logits on GPU
+    half *logits_fp16; // output logits
+    half *logits_d; // output logits on GPU
     // kv cache
-    float* key_cache;   // (layer, seq_len, dim)
-    float* value_cache; // (layer, seq_len, dim)
+    half* key_cache;   // (layer, seq_len, dim)
+    half* value_cache; // (layer, seq_len, dim)
 } RunState;
 
 typedef struct {
@@ -90,7 +92,7 @@ typedef struct {
     RunState state; // buffers for the "wave" of activations in the forward pass
     // some more state needed to properly clean up the memory mapping (sigh)
     int fd; // file descriptor for memory mapping
-    float* data; // memory mapped data pointer
+    half* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
@@ -98,18 +100,19 @@ typedef struct {
 void malloc_run_state(RunState *s, Config *p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    CHECK_CUDA(cudaMalloc((void **)&s->x, p->dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc((void **)&s->xb, p->dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc((void **)&s->xb2, p->dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc((void **)&s->hb, p->hidden_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc((void **)&s->hb2, p->hidden_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc((void **)&s->q, p->dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc((void **)&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
-    CHECK_CUDA(cudaMalloc((void **)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void **)&s->x, p->dim * sizeof(half)));
+    CHECK_CUDA(cudaMalloc((void **)&s->xb, p->dim * sizeof(half)));
+    CHECK_CUDA(cudaMalloc((void **)&s->xb2, p->dim * sizeof(half)));
+    CHECK_CUDA(cudaMalloc((void **)&s->hb, p->hidden_dim * sizeof(half)));
+    CHECK_CUDA(cudaMalloc((void **)&s->hb2, p->hidden_dim * sizeof(half)));
+    CHECK_CUDA(cudaMalloc((void **)&s->q, p->dim * sizeof(half)));
+    CHECK_CUDA(cudaMalloc((void **)&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(half)));
+    CHECK_CUDA(cudaMalloc((void **)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(half)));
 
     // CHECK_CUDA(cudaMalloc(&s->p_pos, sizeof(int)));
-    CHECK_CUDA(cudaMalloc((void **)&s->logits_d, p->vocab_size * sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void **)&s->logits_d, p->vocab_size * sizeof(half)));
     CHECK_CUDA(cudaMallocHost(&s->logits, p->vocab_size * sizeof(float)));
+    CHECK_CUDA(cudaMallocHost(&s->logits_fp16, p->vocab_size * sizeof(half)));
     CHECK_CUDA(cudaDeviceSynchronize());
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->hb || !s->q || !s->key_cache || !s->value_cache || !s->logits) {
@@ -129,9 +132,10 @@ void free_run_state(RunState* s) {
     CHECK_CUDA(cudaFree(s->value_cache));
     CHECK_CUDA(cudaFree(s->logits_d));
     CHECK_CUDA(cudaFreeHost(s->logits));
+    CHECK_CUDA(cudaFreeHost(s->logits_fp16));
 }
 
-void memory_map_weights(TransformerWeights *w, Config* p, float* ptr) {
+void memory_map_weights(TransformerWeights *w, Config* p, half* ptr) {
     int head_size = p->dim / p->n_heads;
     // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
@@ -160,25 +164,26 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr) {
     w->wcls = ptr;
 }
 
-void print_mat(const float *m, int R, int C) {
+void print_mat(const half *m, int R, int C) {
     for (int i = 0; i < MIN(R, 10); ++i) {
         for (int j = 0; j < MIN(C, 10); ++j) {
-            printf("%+.6f ", m[i * C + j]);
+            printf("%+.6f ", __half2float(m[i * C + j]));
         }
         printf("\n");
     }
 }
 
-void print_mat_gpu(const float *m, int R, int C) {
-    float *m_cpu;
-    CHECK_CUDA(cudaMallocHost(&m_cpu, R * C * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(m_cpu, m, R * C * sizeof(float), cudaMemcpyDeviceToHost));
+void print_mat_gpu(const half *m, int R, int C) {
+    half *m_cpu;
+    CHECK_CUDA(cudaMallocHost(&m_cpu, R * C * sizeof(half)));
+    CHECK_CUDA(cudaMemcpy(m_cpu, m, R * C * sizeof(half), cudaMemcpyDeviceToHost));
     print_mat(m_cpu, R, C);
     CHECK_CUDA(cudaFreeHost(m_cpu));
+
 }
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
-                     int* fd, float** data, ssize_t* file_size) {
+                     int* fd, half** data, ssize_t* file_size) {
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
     // read in the config header
@@ -190,10 +195,10 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // memory map the Transformer weights into the data pointer
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = (float *)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    *data = (half *)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    float *weights_cpu_ptr = *data + sizeof(Config)/sizeof(float);
-    float *weights_gpu_ptr;
+    half *weights_cpu_ptr = *data + sizeof(Config)/sizeof(half);
+    half *weights_gpu_ptr;
     size_t weights_size = *file_size - sizeof(Config);
     printf("weights_size: %ld\n", weights_size);
     CHECK_CUDA(cudaMalloc((void **)&weights_gpu_ptr, weights_size));
@@ -219,9 +224,23 @@ void free_transformer(Transformer* t) {
 }
 
 
+void half_to_float(const half *hm, float *fm, int size) {
+    for (int i = 0; i < size; ++i) {
+        fm[i] = __half2float(hm[i]);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // CUDA kernels
+
 __device__ __forceinline__ float warpReduceSum(float val) {
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(FULL_MASK, val, offset);
+    return val;
+}
+
+__device__ __forceinline__ half warpReduceSum(half val) {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
         val += __shfl_xor_sync(FULL_MASK, val, offset);
@@ -277,13 +296,13 @@ __device__ __forceinline__ float blockReduceMax(float val) {
     return val;
 }
 
-__global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
+__global__ void rmsnorm_kernel(half *o, half *x, half *weight, int size) {
     const int thread_id = threadIdx.x;
     const int block_size = blockDim.x;
 
     float ss = 0.0F;
     for (int elem_id = thread_id; elem_id < size; elem_id += block_size)
-        ss += x[elem_id] * x[elem_id];
+        ss += __half2float(x[elem_id]) * __half2float(x[elem_id]);
 
     ss = blockReduceSum(ss);
 
@@ -292,18 +311,18 @@ __global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
     if (threadIdx.x == 0) {
         ss /= size;
         ss += 1e-5f;
-        ss = 1.0f / sqrtf(ss);
-        shared_ss = ss;
+        shared_ss = rsqrtf(ss);
     }
     __syncthreads();
     ss = shared_ss;
 
     // normalize and scale
     for (int elem_id = thread_id; elem_id < size; elem_id += block_size)
-        o[elem_id] = weight[elem_id] * (ss * x[elem_id]);
+        o[elem_id] = __float2half(__half2float(weight[elem_id]) * (ss * __half2float(x[elem_id])));
 }
 
-void rmsnorm(float *o, float *x, float *weight, int size) {
+
+void rmsnorm(half *o, half *x, half *weight, int size) {
     dim3 blockDim(BLOCK_SIZE * BLOCK_SIZE);
     dim3 gridDim(1);
     rmsnorm_kernel<<<gridDim, blockDim>>>(o, x, weight, size);
@@ -350,70 +369,94 @@ __device__ void softmax_kernel(float *x, int size) {
 //     CHECK_CUDA(cudaGetLastError());
 // }
 
-__global__ void mat_vec_kernel(float *C, const float *__restrict__ B, const float *__restrict__ A,
-                               int n, int d, int numSerialLoads) {
-    int index = blockIdx.x * blockDim.y + threadIdx.y;
-    if (index >= d)
+
+__global__ void gemv_fp16_kernel_pack8(
+    half *xout,
+    const half *__restrict__ x,
+    const half *__restrict__ W,
+    int n,
+    int d,
+    int vectorized
+) {
+    int didx = blockIdx.x * blockDim.y + threadIdx.y;
+    // int nidx = blockIdx.y;
+    if (didx >= d)
         return;
 
-    A += index * n;
-    B += blockIdx.y * n;
-    C += blockIdx.y * d;
+    const float4 *W_vec = reinterpret_cast<const float4*>(W + didx * n);
+    const float4 *x_vec = reinterpret_cast<const float4*>(x);
 
     float sum = 0;
-    float4 w;
-    float4 inp;
 
 #pragma unroll
-    for (int i = 0; i < numSerialLoads; i++) {
-        int j = (i * WARP_SIZE + threadIdx.x) * 4;
-        if (j < n) {
-            w = *((float4 *)(&A[j]));
-            inp = *((float4 *)(&B[j]));
-            sum += w.x * inp.x + w.y * inp.y + w.z * inp.z + w.w * inp.w;
+    for (int i = 0; i < vectorized; i++) {
+        int j = (i * WARP_SIZE + threadIdx.x);
+        if (j < n / 8) {
+            float4 x4 = x_vec[j];
+            float4 w4 = W_vec[j];
+            const half2* x_h1 = (half2*)&x4.x;
+            const half2* x_h2 = (half2*)&x4.y;
+            const half2* x_h3 = (half2*)&x4.z;
+            const half2* x_h4 = (half2*)&x4.w;
+
+            const half2* w_h1 = (half2*)&w4.x;
+            const half2* w_h2 = (half2*)&w4.y;
+            const half2* w_h3 = (half2*)&w4.z;
+            const half2* w_h4 = (half2*)&w4.w;
+
+            sum += __half2float(x_h1->x * w_h1->x);
+            sum += __half2float(x_h2->x * w_h2->x);
+            sum += __half2float(x_h3->x * w_h3->x);
+            sum += __half2float(x_h4->x * w_h4->x);
+            sum += __half2float(x_h1->y * w_h1->y);
+            sum += __half2float(x_h2->y * w_h2->y);
+            sum += __half2float(x_h3->y * w_h3->y);
+            sum += __half2float(x_h4->y * w_h4->y);
         }
     }
 
     sum = warpReduceSum(sum);
     if (threadIdx.x == 0)
-        C[index] = sum;
+        xout[didx] = __float2half(sum);
 }
 
-void matmul(float *xout, float *x, float *w, int n, int d) {
-    int serialElements = DIVUP(n, WARP_SIZE);
-    int serialLoads = DIVUP(serialElements, 4);
-    dim3 blockDim(WARP_SIZE, 4);
-    dim3 gridDim(DIVUP(d, 4), 1);
-    mat_vec_kernel<<<gridDim, blockDim>>>(xout, x, w, n, d, serialLoads);
+void matmul(half *xout, half *x, half *w, int n, int d) {
+    // assert((reinterpret_cast<uintptr_t>(x) & 0x3) == 0);
+    // assert((reinterpret_cast<uintptr_t>(w) & 0x3) == 0);
+
+    int groupsize = DIVUP(n, WARP_SIZE);
+    int vectorized = DIVUP(groupsize, 2);
+    dim3 blockDim(WARP_SIZE, 16);
+    dim3 gridDim(DIVUP(d, 16));
+    gemv_fp16_kernel_pack8<<<gridDim, blockDim>>>(xout, x, w, n, d, vectorized);
     CHECK_CUDA(cudaGetLastError());
 }
 
-__global__ void swiglu_kernel(float *shb, float *shb2, int hidden_dim) {
+__global__ void swiglu_kernel(half *shb, half *shb2, int hidden_dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < hidden_dim) {
-        float val = shb[i];
+        float val = __half2float(shb[i]);
         // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
         val *= (1.0f / (1.0f + expf(-val)));
         // elementwise multiply with w3(x)
-        val *= shb2[i];
-        shb[i] = val;
+        val *= __half2float(shb2[i]);
+        shb[i] = __float2half(val);
     }
 }
 
-void swiglu(float *shb, float *shb2, int hidden_dim) {
+void swiglu(half *shb, half *shb2, int hidden_dim) {
     // SwiGLU non-linearity
     dim3 blockDim(BLOCK_SIZE * BLOCK_SIZE);
     dim3 gridDim(DIVUP(hidden_dim, BLOCK_SIZE * BLOCK_SIZE));
     swiglu_kernel<<<gridDim, blockDim>>>(shb, shb2, hidden_dim);
     CHECK_CUDA(cudaGetLastError());
 }
-
-__global__ void multihead_attention_kernel(int pos, float *sq, float *sxb, float *key_cache, float *value_cache,
+__global__ void multihead_attention_fp16_kernel(int pos, half *sq, half *sxb, half *key_cache, half *value_cache,
                                            int kv_dim, int kv_mul, int head_size,
                                            int loff, float scale) {
     int h = blockIdx.x;
     // get the query vector for this head
-    const float *q = sq + h * head_size;
+    const half *q = sq + h * head_size;
     // attention scores for this head
     __shared__ float att[MAX_SEQ_LEN];
     __shared__ float max_val;
@@ -426,16 +469,35 @@ __global__ void multihead_attention_kernel(int pos, float *sq, float *sxb, float
     float m_partial = -FLT_MAX;
     for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
         // get the key vector for this head and at this timestep
-        float *k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+        half *k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
         // calculate the attention score as the dot product of q and k
-        float score = 0.0f;
+        // half2 score = __float2half2_rn(0.0f);
+        double score = 0.0f;
 #pragma unroll
-        for (int i = 0; i < head_size; i += 4) {
+        for (int i = 0; i < head_size; i += 8) {
             a = *((float4 *)(&q[i]));
             b = *((float4 *)(&k[i]));
-            score += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            const __half2* a_h1 = (__half2*)&a.x;
+            const __half2* a_h2 = (__half2*)&a.y;
+            const __half2* a_h3 = (__half2*)&a.z;
+            const __half2* a_h4 = (__half2*)&a.w;
+
+            const __half2* b_h1 = (__half2*)&b.x;
+            const __half2* b_h2 = (__half2*)&b.y;
+            const __half2* b_h3 = (__half2*)&b.z;
+            const __half2* b_h4 = (__half2*)&b.w;
+
+            score += __half2float(a_h1->x * b_h1->x);
+            score += __half2float(a_h2->x * b_h2->x);
+            score += __half2float(a_h3->x * b_h3->x);
+            score += __half2float(a_h4->x * b_h4->x);
+            score += __half2float(a_h1->y * b_h1->y);
+            score += __half2float(a_h2->y * b_h2->y);
+            score += __half2float(a_h3->y * b_h3->y);
+            score += __half2float(a_h4->y * b_h4->y);
         }
         // save the score to the attention buffer
+        // att[t] = __half2float(__hadd(score.x, score.y)) * scale;
         att[t] = score * scale;
         m_partial = fmaxf(m_partial, att[t]);
     }
@@ -445,7 +507,7 @@ __global__ void multihead_attention_kernel(int pos, float *sq, float *sxb, float
         max_val = m_partial;
     __syncthreads();
 
-    float d_partial = 0.0f;
+    double d_partial = 0.0f;
     for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
         att[t] = __expf(att[t] - max_val);
         d_partial += att[t];
@@ -453,24 +515,27 @@ __global__ void multihead_attention_kernel(int pos, float *sq, float *sxb, float
 
     d_partial = blockReduceSum(d_partial);
     if (threadIdx.x == 0)
-        inv_d_total = 1.0f / d_partial;
+        inv_d_total =  __frcp_rn(d_partial);
     __syncthreads();
 
     // weighted sum of the values, store back into xb
     // NOTE: by swapping the order of the for loops (vs. C) a simpler
     // version of the code accomplishes the same task and fits more
     // naturally with the CUDA way of subdividing the problem.
-    float *xb = sxb + h * head_size;
+
+    half *xb = sxb + h * head_size;
+    value_cache = value_cache + loff;
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
-#pragma unroll
+        half *vv = value_cache + (h / kv_mul) * head_size;
+    #pragma unroll
         for (int t = 0; t <= pos; t++) {
             // get the value vector for this head and at this timestep
-            float *v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+            half *v = vv + t * kv_dim;
             // get the attention weight for this timestep
-            val += att[t] * v[i] * inv_d_total;
+            val += att[t] * __half2float(v[i]) * inv_d_total;
         }
-        xb[i] = val;
+        xb[i] = __float2half(val);
     }
 }
 
@@ -478,31 +543,28 @@ __global__ void multihead_attention_kernel(int pos, float *sq, float *sxb, float
 void multihead_attention(Config *p, RunState *s,
                         int pos, int kv_dim, int kv_mul, int head_size, int loff) {
     int n_heads = p->n_heads;
-    int n_layers = p->n_layers;
-    int seq_len = p->seq_len;
-    int dim = p->dim;
-
-    multihead_attention_kernel<<<n_heads, BLOCK_SIZE * BLOCK_SIZE>>>(pos, s->q, s->xb, s->key_cache, s->value_cache, kv_dim, kv_mul, head_size, loff, 1.0 / sqrt(head_size));
+    // printf("n_heads: %d\n", n_heads);
+    multihead_attention_fp16_kernel<<<n_heads, BLOCK_SIZE * BLOCK_SIZE>>>(pos, s->q, s->xb, s->key_cache, s->value_cache, kv_dim, kv_mul, head_size, loff, 1.0 / sqrt(head_size));
     CHECK_CUDA(cudaGetLastError());
 }
 
 
-__global__ void rotary_embedding_kernel(int pos, int dim, float *sq, float *sk, int kv_dim, int head_size) {
+__global__ void rotary_embedding_kernel(int pos, int dim, half *sq, half *sk, int kv_dim, int head_size) {
     for (int j = threadIdx.x; j < dim / 2; j += blockDim.x)
     {
         int i = j * 2;
         int head_dim = i % head_size;
-        float freq = 1.0f / __powf(10000.0f, head_dim / (float)head_size);
-        float val = pos * freq;
-        float fcr = __cosf(val);
-        float fci = __sinf(val);
+        double freq = 1.0f / __powf(10000.0f, head_dim / (float)head_size);
+        double val = pos * freq;
+        double fcr = cos(val);
+        double fci = sin(val);
         int rotn = i < kv_dim ? 2 : 1;  // how many vectors? 2 = q & k, 1 = q only
         for (int v = 0; v < rotn; v++) {
-            float *vec = v == 0 ? sq : sk;  // the vector to rotate (query or key)
-            float v0 = vec[i];
-            float v1 = vec[i + 1];
-            vec[i] = v0 * fcr - v1 * fci;
-            vec[i + 1] = v0 * fci + v1 * fcr;
+            half *vec = v == 0 ? sq : sk;  // the vector to rotate (query or key)
+            half v0 = vec[i];
+            half v1 = vec[i + 1];
+            vec[i] = __float2half(__half2float(v0) * fcr - __half2float(v1) * fci);
+            vec[i + 1] = __float2half(__half2float(v0) * fci + __half2float(v1) * fcr);
         }
     }
 }
@@ -517,14 +579,14 @@ void rotary_embedding(RunState *s, int pos, int dim, int kv_dim, int head_size) 
 }
 
 
-__global__ void skip_conn_kernel(float *x, float *y, int dim) {
+__global__ void skip_conn_kernel(half *x, half *y, int dim) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < dim) {
         x[i] += y[i];
     }
 }
 
-void skip_conn(float *x, float *y, int dim) {
+void skip_conn(half *x, half *y, int dim) {
     dim3 blockDim(BLOCK_SIZE * BLOCK_SIZE);
     dim3 gridDim(DIVUP(dim, BLOCK_SIZE * BLOCK_SIZE));
     skip_conn_kernel<<<gridDim, blockDim>>>(x, y, dim);
@@ -606,16 +668,26 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     // a few convenience variables
     Config* p = &transformer->config;
+    // print all config
+    // printf("dim: %d\n", p->dim);
+    // printf("n_heads: %d\n", p->n_heads);
+    // printf("n_kv_heads: %d\n", p->n_kv_heads);
+    // printf("hidden_dim: %d\n", p->hidden_dim);
+    // printf("seq_len: %d\n", p->seq_len);
+    // printf("n_layers: %d\n", p->n_layers);
+    // printf("vocab_size: %d\n", p->vocab_size);
+
+
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
-    float *x = s->x;
+    half *x = s->x;
     int dim = p->dim;
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
     // copy the token embedding into x
-    float* content_row = w->token_embedding_table + token * dim;
+    half* content_row = w->token_embedding_table + token * dim;
     // check_pointer_location(x);
     // check_pointer_location(content_row);
     CHECK_CUDA(cudaMemcpy(x, content_row, dim * sizeof(*x), cudaMemcpyDeviceToDevice));
@@ -728,8 +800,9 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     // classifier into logits
     matmul(s->logits_d, x, w->wcls, p->dim, p->vocab_size);
-    CHECK_CUDA(cudaMemcpy(s->logits, s->logits_d, p->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(s->logits_fp16, s->logits_d, p->vocab_size * sizeof(half), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaDeviceSynchronize());
+    half_to_float(s->logits_fp16, s->logits, p->vocab_size);
     return s->logits;
 }
 

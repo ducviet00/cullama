@@ -94,7 +94,7 @@ def export_hf_model_to_binary(model_path, export_path, dtype=torch.float32):
     model_weights["lm_head_weight"] = [hf_dict["lm_head.weight"]]
 
     for layer_name, layer in model_weights.items():
-        print(f"Writing {layer_name} weights")
+        print(f"Writing {layer_name} weights, dtype {layer[0].dtype}")
         for w in layer:
             serialize(out_file, w, dtype)
 
@@ -115,4 +115,4 @@ if __name__ == "__main__":
         "int8": torch.int8,
     }[args.dtype]
 
-    export_hf_model_to_binary(args.hf, args.out)
+    export_hf_model_to_binary(args.hf, args.out, dtype)
