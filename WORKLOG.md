@@ -6,6 +6,8 @@ Singles' Day 👋
 
 I created an FP16 version that runs at 81 tok/s, which is 20% slower compared to GPT-Fast (106 tok/s). Benchmarking is still ongoing on the A100 80GB PCIe.
 
+TODO: fused kernels
+
 ## 2024-11-01
 
 Hello November 👋
